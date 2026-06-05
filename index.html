@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chess Puzzle Vault</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+    <link rel="stylesheet" href="style.css">
+    <style>
+
+    </style>
+</head>
+
+<body>
+
+    <header>
+        <div class="logo">♟ Chess Puzzle Vault <span>personal archive</span></div>
+        <div class="header-actions">
+            <button class="ghost" onclick="importJSON()">⬆ Import JSON</button>
+            <button class="ghost" onclick="exportJSON()">⬇ Export JSON</button>
+            <button class="primary" id="fetch-btn" onclick="fetchTodaysPuzzle()">Fetch Today's Puzzle</button>
+            <input type="file" id="file-input" accept=".json" onchange="handleFileImport(event)">
+        </div>
+    </header>
+
+    <div class="main">
+        <div class="sidebar">
+            <div class="sidebar-top">
+                <h2>Saved Puzzles</h2>
+                <span class="count-pill" id="count-pill">0</span>
+            </div>
+            <div class="puzzle-list" id="puzzle-list"></div>
+        </div>
+        <div class="content" id="content">
+            <div class="empty-state">
+                <div class="empty-icon">♜</div>
+                <h2>Your vault is empty</h2>
+                <p>Click <strong style="color:var(--accent)">Fetch Today's Puzzle</strong> to grab Chess.com's daily
+                    puzzle and save it permanently.</p>
+                <p style="margin-top:0.4rem;font-size:0.76rem;color:var(--muted);">Use <em>Export JSON</em> to save your
+                    vault to a file, and <em>Import JSON</em> to reload it anytime.</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        // ── Piece image URLs (Lichess CDN — cburnett set, same as Chess.com) ──────────
+        // Format: https://lichess1.org/assets/piece/cburnett/{color}{Piece}.svg
+        // color: w = white, b = black   Piece: K Q R B N P
+        function pieceUrl(color, type) {
+            const c = color === 'w' ? 'w' : 'b';
+            const t = type.toUpperCase();
+            return `https://lichess1.org/assets/piece/cburnett/${c}${t}.svg`;
+        }
+
+        // ── State ─────────────────────────────────────────────────────────────────────
+        let puzzles = {}, activeId = null, game = null, startFen = '';
+        let solutionMoves = [], solIdx = 0;
+        let selectedSq = null, legalTargets = [];
+        let lastFrom = null, lastTo = null;
+        let moveHistory = [], puzzleDone = false;
+
+        // ── Session storage (export JSON to persist long-term) ────────────────────────
+        function loadSession() { try { puzzles = JSON.parse(sessionStorage.getItem('cpv_v4')) || {}; } catch (e) { puzzles = {}; } }
+        function saveSession() { sessionStorage.setItem('cpv_v4', JSON.stringify(puzzles)); }
+
+        function init() {
+            loadSession();
+            renderSidebar();
+            const ids = sortedIds();
+            if (ids.length) loadPuzzle(ids[0]);
+        }
+
+        function sortedIds() { return Object.keys(puzzles).sort().reverse(); }
+
+        // ── Toast ─────────────────────────────────────────────────────────────────────
+        function toast(msg, ms = 3000) {
+            const el = document.getElementById('toast');
+            el.textContent = msg; el.classList.add('show');
+            setTimeout(() => el.classList.remove('show'), ms);
+        }
+
+        // ── Fetch today's puzzle ──────────────────────────────────────────────────────
+        async function fetchTodaysPuzzle() {
+            const btn = document.getElementById('fetch-btn');
+            btn.innerHTML = '<span class="spinner"></span>Fetching…'; btn.disabled = true;
+            try {
+                const res = await fetch('https://api.chess.com/pub/puzzle', { cache: 'no-store' });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const d = await res.json();
+                const id = new Date(d.publish_time * 1000).toISOString().split('T')[0];
+                if (puzzles[id]) {
+                    toast('Today\'s puzzle is already saved (' + id + ')');
+                } else {
+                    puzzles[id] = {
+                        id, title: d.title, url: d.url, fen: d.fen, pgn: d.pgn,
+                        publish_time: d.publish_time, savedAt: Date.now(),
+                        status: 'unseen', wrongMoves: 0
+                    };
+                    saveSession(); renderSidebar();
+                    toast('✓ Saved: ' + id);
+                }
+                loadPuzzle(id);
+            } catch (e) {
+                toast('⚠ Fetch failed — check your internet connection', 4000);
+            }
+            btn.textContent = 'Fetch Today\'s Puzzle'; btn.disabled = false;
+        }
+
+        // ── Export / Import JSON ──────────────────────────────────────────────────────
+        function exportJSON() {
+            const ids = sortedIds();
+            if (!ids.length) { toast('Nothing to export yet'); return; }
+            const blob = new Blob(
+                [JSON.stringify({ exported: new Date().toISOString(), count: ids.length, puzzles }, null, 2)],
+                { type: 'application/json' }
+            );
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'chess_puzzle_vault_' + new Date().toISOString().split('T')[0] + '.json';
+            a.click(); URL.revokeObjectURL(a.href);
+            toast('✓ Exported ' + ids.length + ' puzzle' + (ids.length > 1 ? 's' : ''));
+        }
+
+        function importJSON() { document.getElementById('file-input').click(); }
+
+        function handleFileImport(e) {
+            const file = e.target.files[0]; if (!file) return;
+            const reader = new FileReader();
+            reader.onload = ev => {
+                try {
+                    const data = JSON.parse(ev.target.result);
+                    const src = data.puzzles || data;
+                    let added = 0;
+                    Object.keys(src).forEach(id => { if (!puzzles[id]) { puzzles[id] = src[id]; added++; } });
+                    saveSession(); renderSidebar();
+                    toast('✓ Imported ' + added + ' new puzzle' + (added !== 1 ? 's' : ''));
+                    const ids = sortedIds(); if (ids.length) loadPuzzle(ids[0]);
+                } catch (err) { toast('⚠ Invalid JSON file', 4000); }
+            };
+            reader.readAsText(file); e.target.value = '';
+        }
+
+        // ── Sidebar ───────────────────────────────────────────────────────────────────
+        function renderSidebar() {
+            const ids = sortedIds();
+            document.getElementById('count-pill').textContent = ids.length;
+            const list = document.getElementById('puzzle-list');
+            if (!ids.length) {
+                list.innerHTML = '<div style="padding:1rem;font-size:0.78rem;color:var(--muted);text-align:center;">No puzzles yet</div>';
+                return;
+            }
+            list.innerHTML = ids.map(id => {
+                const p = puzzles[id];
+                const dateLabel = new Date(p.publish_time * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+                const statusLabel = p.status === 'solved' ? '✓ Solved' : p.status === 'attempted' ? '• In progress' : '○ Not started';
+                return `<div class="puzzle-item${id === activeId ? ' active' : ''}" onclick="loadPuzzle('${id}')">
+      <div class="pi-date">${dateLabel}</div>
+      <div class="pi-title">${esc(p.title)}</div>
+      <div class="pi-status ${p.status || 'unseen'}">${statusLabel}</div>
+    </div>`;
+            }).join('');
+        }
+
+        function esc(s = '') { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+        // ── Load puzzle ───────────────────────────────────────────────────────────────
+        function loadPuzzle(id) {
+            activeId = id;
+            const p = puzzles[id];
+            startFen = p.fen;
+            game = new Chess(p.fen);
+            solutionMoves = parseSolution(p.pgn);
+            solIdx = 0; selectedSq = null; legalTargets = [];
+            lastFrom = null; lastTo = null; moveHistory = []; puzzleDone = false;
+            renderPuzzleUI(p);
+            renderSidebar();
+        }
+
+        function parseSolution(pgn = '') {
+            const tmp = new Chess(startFen);
+            // Strip all annotations, then replay moves via chess.js to get clean SAN
+            const clean = pgn
+                .replace(/\{[^}]*\}/g, '')
+                .replace(/\([^)]*\)/g, '')
+                .replace(/\$\d+/g, '')
+                .replace(/1-0|0-1|1\/2-1\/2|\*/g, '');
+
+            const tokens = clean.split(/\s+/).filter(t => t.trim());
+            const moves = [];
+            for (const t of tokens) {
+                if (/^\d+\.+$/.test(t) || !t) continue;
+                const m = tmp.move(t, { sloppy: true });
+                if (m) moves.push(m.san); // store normalised SAN from chess.js itself
+            }
+            console.log('[Vault] Parsed solution moves:', moves);
+            return moves;
+        }
+
+        function sideToMove(fen) { return fen.split(' ')[1] === 'w' ? 'white' : 'black'; }
+
+        // ── Render puzzle UI ──────────────────────────────────────────────────────────
+        function renderPuzzleUI(p) {
+            const color = sideToMove(p.fen);
+            document.getElementById('content').innerHTML = `
+    <div class="puzzle-area">
+      <div class="board-col">
+        <div id="board"></div>
+        <div class="board-controls">
+          <button class="ghost" onclick="resetPuzzle()">↺ Reset</button>
+          <button class="ghost" onclick="undoMove()">← Undo</button>
+        </div>
+      </div>
+      <div class="info-col">
+        <div class="info-card">
+          <h3>${esc(p.title)}</h3>
+          <div class="meta-row">
+            <span class="meta-label">Date</span>
+            <span class="meta-val">${new Date(p.publish_time * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}</span>
+          </div>
+          <div class="meta-row">
+            <span class="meta-label">To move</span>
+            <span class="meta-val">
+              <span class="turn-badge ${color}">
+                <span class="turn-dot"></span>${color[0].toUpperCase() + color.slice(1)}
+              </span>
+            </span>
+          </div>
+          <div class="meta-row">
+            <span class="meta-label">Source</span>
+            <span class="meta-val"><a href="${esc(p.url)}" target="_blank" style="color:var(--accent2);text-decoration:none;">chess.com ↗</a></span>
+          </div>
+        </div>
+
+        <div id="status-area">
+          <div class="status-box info">Find the best move for ${color}!</div>
+        </div>
+
+        <div class="info-card">
+          <div class="label">Move history</div>
+          <div class="move-history" id="move-history">
+            <span style="color:var(--muted);font-size:0.78rem;">No moves yet</span>
+          </div>
+        </div>
+
+        <button class="ghost" onclick="exportJSON()" style="width:100%;">⬇ Save vault to JSON</button>
+      </div>
+    </div>`;
+            drawBoard();
+        }
+
+        // ── Draw board ────────────────────────────────────────────────────────────────
+        function drawBoard() {
+            const el = document.getElementById('board');
+            if (!el || !game) return;
+
+            const flipped = sideToMove(startFen) === 'black';
+            const ranks = flipped ? [1, 2, 3, 4, 5, 6, 7, 8] : [8, 7, 6, 5, 4, 3, 2, 1];
+            const files = flipped ? ['h', 'g', 'f', 'e', 'd', 'c', 'b', 'a'] : ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+
+            el.innerHTML = '';
+
+            ranks.forEach(r => {
+                files.forEach((f, fi) => {
+                    const sq = f + r;
+                    const isLight = (f.charCodeAt(0) - 97 + r) % 2 === 1;
+                    const piece = game.get(sq);
+                    const isSel = selectedSq === sq;
+                    const isLegal = legalTargets.includes(sq);
+                    const isCap = isLegal && !!piece;
+                    const isLast = sq === lastFrom || sq === lastTo;
+
+                    let cls = `sq ${isLight ? 'light' : 'dark'}`;
+                    if (isSel) cls += ' selected';
+                    if (isLast) cls += ' last-from';
+                    if (isLegal && !isCap) cls += ' legal-move';
+                    if (isCap) cls += ' legal-capture';
+
+                    const div = document.createElement('div');
+                    div.className = cls;
+                    div.dataset.sq = sq;
+
+                    // Piece image — hide only when this square is actively being dragged
+                    if (piece) {
+                        const img = document.createElement('img');
+                        img.className = 'piece';
+                        img.src = pieceUrl(piece.color, piece.type);
+                        img.alt = piece.color + piece.type;
+                        if (dragState.active && dragState.from === sq) img.style.opacity = '0';
+                        div.appendChild(img);
+                    }
+
+                    // Coordinate labels
+                    if (fi === 0) {
+                        const s = document.createElement('span');
+                        s.className = 'coord rank'; s.textContent = r;
+                        div.appendChild(s);
+                    }
+                    if (r === ranks[ranks.length - 1]) {
+                        const s = document.createElement('span');
+                        s.className = 'coord file'; s.textContent = f;
+                        div.appendChild(s);
+                    }
+
+                    // Both click and drag start from mousedown/touchstart
+                    div.addEventListener('mousedown', e => onPointerDown(e, sq));
+                    div.addEventListener('touchstart', e => onPointerDown(e, sq), { passive: false });
+                    el.appendChild(div);
+                });
+            });
+        }
+
+        // ── Drag state ────────────────────────────────────────────────────────────────
+        let dragState = {
+            active: false,
+            from: null,
+            ghost: null,       // floating img element
+            startX: 0, startY: 0,
+            moved: false,      // did the pointer travel far enough to count as a drag?
+        };
+
+        function getClientXY(e) {
+            if (e.touches && e.touches.length) return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+            if (e.changedTouches && e.changedTouches.length) return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+            return { x: e.clientX, y: e.clientY };
+        }
+
+        function sqFromPoint(x, y) {
+            // Hide ghost temporarily so elementFromPoint sees the board squares beneath
+            if (dragState.ghost) dragState.ghost.style.display = 'none';
+            const el = document.elementFromPoint(x, y);
+            if (dragState.ghost) dragState.ghost.style.display = '';
+            if (!el) return null;
+            const sq = el.closest ? el.closest('[data-sq]') : null;
+            return sq ? sq.dataset.sq : null;
+        }
+
+        function onPointerDown(e, sq) {
+            if (puzzleDone || !game) return;
+            const playerColor = sideToMove(startFen) === 'white' ? 'w' : 'b';
+            if (game.turn() !== playerColor) return;
+
+            const piece = game.get(sq);
+            if (!piece || piece.color !== playerColor) {
+                // Clicked an empty square or opponent piece — handle as click target
+                handleClickTarget(sq);
+                return;
+            }
+
+            // Clicking the already-selected piece → deselect it
+            if (selectedSq === sq) {
+                selectedSq = null; legalTargets = [];
+                dragState.from = null;
+                drawBoard();
+                return;
+            }
+
+            e.preventDefault();
+            const { x, y } = getClientXY(e);
+            dragState.startX = x;
+            dragState.startY = y;
+            dragState.from = sq;
+            dragState.active = false;
+            dragState.moved = false;
+
+            // Select this piece and show legal moves
+            selectedSq = sq;
+            legalTargets = game.moves({ square: sq, verbose: true }).map(m => m.to);
+            drawBoard();
+
+            // Create ghost image that follows cursor
+            const boardEl = document.getElementById('board');
+            const sqSize = boardEl ? boardEl.offsetWidth / 8 : 72;
+
+            const ghost = document.createElement('img');
+            ghost.src = pieceUrl(piece.color, piece.type);
+            ghost.style.cssText = `
+    position: fixed; z-index: 1000; pointer-events: none;
+    width: ${sqSize}px; height: ${sqSize}px;
+    left: ${x - sqSize / 2}px; top: ${y - sqSize / 2}px;
+    display: none; cursor: grabbing;
+    filter: drop-shadow(0 4px 12px rgba(0,0,0,0.5));
+  `;
+            document.body.appendChild(ghost);
+            dragState.ghost = ghost;
+
+            document.addEventListener('mousemove', onPointerMove);
+            document.addEventListener('mouseup', onPointerUp);
+            document.addEventListener('touchmove', onPointerMove, { passive: false });
+            document.addEventListener('touchend', onPointerUp);
+        }
+
+        function onPointerMove(e) {
+            if (!dragState.from) return;
+            e.preventDefault();
+            const { x, y } = getClientXY(e);
+            const dx = x - dragState.startX, dy = y - dragState.startY;
+
+            // Only activate drag after moving 4px (avoids accidental drags on clicks)
+            if (!dragState.active && Math.sqrt(dx * dx + dy * dy) > 4) {
+                dragState.active = true;
+                dragState.ghost.style.display = '';
+                drawBoard(); // hide the piece on its square now that we're dragging
+            }
+
+            if (dragState.active && dragState.ghost) {
+                const boardEl = document.getElementById('board');
+                const sqSize = boardEl ? boardEl.offsetWidth / 8 : 72;
+                dragState.ghost.style.left = (x - sqSize / 2) + 'px';
+                dragState.ghost.style.top = (y - sqSize / 2) + 'px';
+
+                // Highlight square under cursor
+                const hoverSq = sqFromPoint(x, y);
+                document.querySelectorAll('.sq.drag-over').forEach(el => el.classList.remove('drag-over'));
+                if (hoverSq && legalTargets.includes(hoverSq)) {
+                    const el = document.querySelector(`[data-sq="${hoverSq}"]`);
+                    if (el) el.classList.add('drag-over');
+                }
+            }
+        }
+
+        function onPointerUp(e) {
+            document.removeEventListener('mousemove', onPointerMove);
+            document.removeEventListener('mouseup', onPointerUp);
+            document.removeEventListener('touchmove', onPointerMove);
+            document.removeEventListener('touchend', onPointerUp);
+
+            if (dragState.ghost) { dragState.ghost.remove(); dragState.ghost = null; }
+            document.querySelectorAll('.sq.drag-over').forEach(el => el.classList.remove('drag-over'));
+
+            const { x, y } = getClientXY(e);
+
+            if (dragState.active) {
+                // It was a drag — try to drop on the square under cursor
+                const targetSq = sqFromPoint(x, y);
+                dragState.active = false;
+                const from = dragState.from;
+                dragState.from = null;
+
+                if (targetSq && legalTargets.includes(targetSq)) {
+                    doMove(from, targetSq);
+                } else {
+                    // Dropped off-board or on illegal square — cancel
+                    selectedSq = null; legalTargets = [];
+                    drawBoard();
+                }
+            } else {
+                // It was a click (pointer barely moved) — let click logic handle it
+                dragState.from = null;
+                // selectedSq is already set by onPointerDown; nothing else to do
+            }
+        }
+
+        // ── Click handler (for second-click-to-move) ──────────────────────────────────
+        function handleClickTarget(sq) {
+            if (puzzleDone || !game) return;
+            const playerColor = sideToMove(startFen) === 'white' ? 'w' : 'b';
+            if (game.turn() !== playerColor) return;
+            const piece = game.get(sq);
+
+            if (selectedSq) {
+                if (legalTargets.includes(sq)) {
+                    // Valid destination — make the move
+                    doMove(selectedSq, sq); return;
+                }
+                if (piece && piece.color === playerColor) {
+                    // Clicked a different own piece — switch selection to it
+                    selectedSq = sq;
+                    legalTargets = game.moves({ square: sq, verbose: true }).map(m => m.to);
+                    drawBoard(); return;
+                }
+                // Clicked empty or opponent square that isn't a legal move — deselect
+                selectedSq = null; legalTargets = [];
+                drawBoard();
+            }
+        }
+
+        // ── Execute move ──────────────────────────────────────────────────────────────
+        function doMove(from, to) {
+            const move = game.move({ from, to, promotion: 'q' });
+            if (!move) return;
+            lastFrom = from; lastTo = to;
+            selectedSq = null; legalTargets = [];
+
+            const expected = solutionMoves[solIdx];
+            console.log('[Vault] Played:', move.san, '(', from, '->', to, ') | Expected SAN:', expected);
+
+            const correct = moveMatchesSolution(move, expected);
+            console.log('[Vault] Correct:', correct);
+
+            moveHistory.push({ san: move.san, correct, isPlayer: true });
+            renderMoveHistory();
+            drawBoard();
+
+            if (!correct) {
+                puzzles[activeId].status = 'attempted';
+                saveSession();
+                setStatus('error', '✗ Not the best move — try again');
+                setTimeout(() => {
+                    game.undo(); lastFrom = null; lastTo = null;
+                    moveHistory.pop(); renderMoveHistory();
+                    setStatus('info', 'Try again!'); drawBoard();
+                }, 850);
+                return;
+            }
+
+            solIdx++;
+
+            if (solIdx >= solutionMoves.length) {
+                setStatus('success', '🎉 Brilliant! Puzzle solved!');
+                puzzleDone = true;
+                puzzles[activeId].status = 'solved';
+                saveSession(); renderSidebar();
+                return;
+            }
+
+            setStatus('success', '✓ Correct!');
+            setTimeout(() => playOpponentMove(), 600);
+        }
+
+        // ── Robust move matching ──────────────────────────────────────────────────────
+        // We already know the player made a legal move; we just need to confirm it
+        // lands on the correct destination square (and matches piece type for safety).
+        function moveMatchesSolution(playedMove, expectedSan) {
+            if (!expectedSan) return false;
+            const strip = s => s.replace(/[+#!?]/g, '');
+            return strip(playedMove.san) === strip(expectedSan);
+        }
+
+        // ── Opponent auto-reply ───────────────────────────────────────────────────────
+        function playOpponentMove() {
+            const san = solutionMoves[solIdx];
+            if (!san) return;
+
+            const move = game.move(san, { sloppy: true });
+            if (!move) return;
+
+            lastFrom = move.from; lastTo = move.to;
+            solIdx++;
+            moveHistory.push({ san: move.san, correct: true, isPlayer: false });
+            renderMoveHistory();
+            drawBoard();
+
+            if (solIdx >= solutionMoves.length) {
+                // Puzzle ends on opponent's move (shouldn't normally happen, but handle it)
+                setStatus('success', '🎉 Brilliant! Puzzle solved!');
+                puzzleDone = true;
+                puzzles[activeId].status = 'solved';
+                saveSession(); renderSidebar();
+            } else {
+                setStatus('info', 'Your turn — find the next move!');
+            }
+        }
+
+
+        // ── Undo / Reset ──────────────────────────────────────────────────────────────
+        function undoMove() {
+            if (!moveHistory.length || puzzleDone) return;
+
+            // If the last entry was an opponent move, undo it first silently
+            const last = moveHistory[moveHistory.length - 1];
+            if (last && !last.isPlayer) {
+                game.undo(); moveHistory.pop(); solIdx--;
+            }
+
+            // Now undo the player's move
+            if (moveHistory.length && moveHistory[moveHistory.length - 1].isPlayer) {
+                game.undo(); moveHistory.pop(); solIdx--;
+            }
+
+            lastFrom = null; lastTo = null; selectedSq = null; legalTargets = [];
+            renderMoveHistory();
+            setStatus('info', 'Move undone — try again');
+            drawBoard();
+        }
+
+        function resetPuzzle() {
+            game = new Chess(startFen);
+            solIdx = 0; selectedSq = null; legalTargets = [];
+            lastFrom = null; lastTo = null; moveHistory = []; puzzleDone = false;
+            setStatus('info', 'Find the best move for ' + sideToMove(startFen) + '!');
+            renderMoveHistory(); drawBoard();
+        }
+
+        // ── Status & history ──────────────────────────────────────────────────────────
+        function setStatus(type, msg) {
+            const el = document.getElementById('status-area');
+            if (el) el.innerHTML = `<div class="status-box ${type}">${esc(msg)}</div>`;
+        }
+
+        function renderMoveHistory() {
+            const el = document.getElementById('move-history');
+            if (!el) return;
+            if (!moveHistory.length) {
+                el.innerHTML = '<span style="color:var(--muted);font-size:0.78rem;">No moves yet</span>';
+                return;
+            }
+            let html = '';
+            for (let i = 0; i < moveHistory.length; i += 2) {
+                const first = moveHistory[i];
+                const second = moveHistory[i + 1];
+                const firstCls = first.isPlayer ? (first.correct ? 'correct' : 'wrong') : 'opponent';
+                const secondCls = second ? (second.isPlayer ? (second.correct ? 'correct' : 'wrong') : 'opponent') : '';
+                html += `<div class="move-row">
+      <span class="move-num">${Math.floor(i / 2) + 1}.</span>
+      <span class="move-san ${firstCls}">${esc(first.san)}</span>
+      ${second ? `<span class="move-san ${secondCls}">${esc(second.san)}</span>` : ''}
+    </div>`;
+            }
+            el.innerHTML = html; el.scrollTop = el.scrollHeight;
+        }
+
+        init();
+    </script>
+</body>
+
+</html>
