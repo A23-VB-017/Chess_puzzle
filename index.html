@@ -48,8 +48,6 @@
 
     <script>
         // ── Piece image URLs (Lichess CDN — cburnett set, same as Chess.com) ──────────
-        // Format: https://lichess1.org/assets/piece/cburnett/{color}{Piece}.svg
-        // color: w = white, b = black   Piece: K Q R B N P
         function pieceUrl(color, type) {
             const c = color === 'w' ? 'w' : 'b';
             const t = type.toUpperCase();
@@ -63,7 +61,7 @@
         let lastFrom = null, lastTo = null;
         let moveHistory = [], puzzleDone = false;
 
-        // ── Session storage (export JSON to persist long-term) ────────────────────────
+        // ── Session storage ───────────────────────────────────────────────────────────
         function loadSession() { try { puzzles = JSON.parse(sessionStorage.getItem('cpv_v4')) || {}; } catch (e) { puzzles = {}; } }
         function saveSession() { sessionStorage.setItem('cpv_v4', JSON.stringify(puzzles)); }
 
@@ -180,21 +178,26 @@
             renderSidebar();
         }
 
+        // ── parseSolution ─────────────────────────────────────────────────────────────
+        // Chess.com puzzle PGNs contain only the solution moves (not full game
+        // history), so we simply replay every non-move-number token against a fresh
+        // copy of the puzzle FEN.  chess.js rejects anything that isn't a legal move
+        // at that point, so stray header tokens are silently skipped.
         function parseSolution(pgn = '') {
             const tmp = new Chess(startFen);
-            // Strip all annotations, then replay moves via chess.js to get clean SAN
             const clean = pgn
-                .replace(/\{[^}]*\}/g, '')
-                .replace(/\([^)]*\)/g, '')
-                .replace(/\$\d+/g, '')
-                .replace(/1-0|0-1|1\/2-1\/2|\*/g, '');
+                .replace(/\{[^}]*\}/g, '')          // remove {comments}
+                .replace(/\([^)]*\)/g, '')          // remove (variations)
+                .replace(/\$\d+/g, '')              // remove $NAG symbols
+                .replace(/[!?]+/g, '')              // remove move annotation suffixes (!, !!, !?, ?!, ?)
+                .replace(/1-0|0-1|1\/2-1\/2|\*/g, ''); // remove result
 
             const tokens = clean.split(/\s+/).filter(t => t.trim());
             const moves = [];
             for (const t of tokens) {
                 if (/^\d+\.+$/.test(t) || !t) continue;
                 const m = tmp.move(t, { sloppy: true });
-                if (m) moves.push(m.san); // store normalised SAN from chess.js itself
+                if (m) moves.push(m.san); // store chess.js-normalised SAN
             }
             console.log('[Vault] Parsed solution moves:', moves);
             return moves;
@@ -282,7 +285,6 @@
                     const div = document.createElement('div');
                     div.className = cls;
                     div.dataset.sq = sq;
-
                     // Piece image — hide only when this square is actively being dragged
                     if (piece) {
                         const img = document.createElement('img');
@@ -292,7 +294,6 @@
                         if (dragState.active && dragState.from === sq) img.style.opacity = '0';
                         div.appendChild(img);
                     }
-
                     // Coordinate labels
                     if (fi === 0) {
                         const s = document.createElement('span');
@@ -304,7 +305,6 @@
                         s.className = 'coord file'; s.textContent = f;
                         div.appendChild(s);
                     }
-
                     // Both click and drag start from mousedown/touchstart
                     div.addEventListener('mousedown', e => onPointerDown(e, sq));
                     div.addEventListener('touchstart', e => onPointerDown(e, sq), { passive: false });
@@ -317,9 +317,9 @@
         let dragState = {
             active: false,
             from: null,
-            ghost: null,       // floating img element
+            ghost: null, // floating img element
             startX: 0, startY: 0,
-            moved: false,      // did the pointer travel far enough to count as a drag?
+            moved: false,  // did the pointer travel far enough to count as a drag?
         };
 
         function getClientXY(e) {
@@ -454,7 +454,7 @@
             }
         }
 
-        // ── Click handler (for second-click-to-move) ──────────────────────────────────
+        // ── Click handler (for second-click-to-move)─────────────────────────────────────────────────────────────
         function handleClickTarget(sq) {
             if (puzzleDone || !game) return;
             const playerColor = sideToMove(startFen) === 'white' ? 'w' : 'b';
@@ -478,6 +478,32 @@
             }
         }
 
+        // ── FIX 2: Wrap audio calls in try-catch everywhere ───────────────────────────
+        // Setting .currentTime = 0 on an Audio element that failed to load can throw
+        // a synchronous DOMException in some browsers, which would abort the calling
+        // function mid-execution and leave the game in a broken state.
+        function playSound(sfx) {
+            try {
+                sfx.currentTime = 0;
+                const p = sfx.play();
+                if (p && typeof p.catch === 'function') p.catch(() => { });
+            } catch (e) {
+                // Audio not available — silently ignore
+            }
+        }
+
+        function soundForMove(move) {
+            if (move.flags.includes('k') || move.flags.includes('q')) {
+                playSound(SFX.castle);
+            } else if (move.san.includes('+') || move.san.includes('#')) {
+                playSound(SFX.check);
+            } else if (move.captured) {
+                playSound(SFX.capture);
+            } else {
+                playSound(SFX.move);
+            }
+        }
+
         // ── Execute move ──────────────────────────────────────────────────────────────
         function doMove(from, to) {
             const move = game.move({ from, to, promotion: 'q' });
@@ -494,12 +520,14 @@
             moveHistory.push({ san: move.san, correct, isPlayer: true });
             renderMoveHistory();
             drawBoard();
+            soundForMove(move);
 
             if (!correct) {
                 puzzles[activeId].status = 'attempted';
                 saveSession();
                 setStatus('error', '✗ Not the best move — try again');
                 setTimeout(() => {
+                    playSound(SFX.wrong);
                     game.undo(); lastFrom = null; lastTo = null;
                     moveHistory.pop(); renderMoveHistory();
                     setStatus('info', 'Try again!'); drawBoard();
@@ -511,6 +539,7 @@
 
             if (solIdx >= solutionMoves.length) {
                 setStatus('success', '🎉 Brilliant! Puzzle solved!');
+                setTimeout(() => playSound(SFX.solved), 150);
                 puzzleDone = true;
                 puzzles[activeId].status = 'solved';
                 saveSession(); renderSidebar();
@@ -530,37 +559,70 @@
             return strip(playedMove.san) === strip(expectedSan);
         }
 
-        // ── Opponent auto-reply ───────────────────────────────────────────────────────
+        // ── FIX 3: Opponent auto-reply — graceful recovery + no premature puzzleDone ─
+        // Two previous bugs lived here:
+        //   (a) If game.move() returned null the function silently returned, leaving
+        //       game.turn() as the opponent's colour — the player could not interact at
+        //       all, and even undo appeared to do nothing because the board re-drew in
+        //       the same stuck state.
+        //   (b) The "shouldn't normally happen" puzzleDone = true block fired whenever
+        //       parseSolution had under-counted the solution moves (e.g. because the
+        //       PGN contained full-game history and some early moves were coincidentally
+        //       legal from the puzzle FEN).  This set puzzleDone = true after the
+        //       opponent's check, locking both the board AND the undo button.
+        //
+        // Fix: (a) on move failure, undo the player's last move to restore a clean
+        // interactive state; (b) never mark the puzzle done inside playOpponentMove —
+        // a puzzle is only "solved" when the PLAYER makes the decisive last move.
         function playOpponentMove() {
             const san = solutionMoves[solIdx];
-            if (!san) return;
+            if (!san) {
+                // No more opponent moves in the solution — player has one more move to find
+                setStatus('info', 'Your turn — find the next move!');
+                return;
+            }
 
             const move = game.move(san, { sloppy: true });
-            if (!move) return;
+
+            // ── (a) Recovery when the opponent move fails to apply ────────────────────
+            if (!move) {
+                console.error('[Vault] Opponent move failed:', san, '| FEN:', game.fen());
+                // Undo the player's last move so game.turn() goes back to the player's
+                // colour and the board remains fully interactive.
+                const lastEntry = moveHistory[moveHistory.length - 1];
+                if (lastEntry && lastEntry.isPlayer) {
+                    game.undo();
+                    solIdx--;
+                    moveHistory.pop();
+                    renderMoveHistory();
+                    lastFrom = null; lastTo = null;
+                }
+                setStatus('error', '⚠ Puzzle response error — try resetting the puzzle');
+                drawBoard();
+                return;
+            }
 
             lastFrom = move.from; lastTo = move.to;
             solIdx++;
             moveHistory.push({ san: move.san, correct: true, isPlayer: false });
             renderMoveHistory();
             drawBoard();
+            soundForMove(move);
 
-            if (solIdx >= solutionMoves.length) {
-                // Puzzle ends on opponent's move (shouldn't normally happen, but handle it)
-                setStatus('success', '🎉 Brilliant! Puzzle solved!');
-                puzzleDone = true;
-                puzzles[activeId].status = 'solved';
-                saveSession(); renderSidebar();
-            } else {
-                setStatus('info', 'Your turn — find the next move!');
-            }
+            // ── (b) Do NOT set puzzleDone here ───────────────────────────────────────
+            // Puzzles should always end with the player's winning move.  If solIdx has
+            // reached the end of solutionMoves after the opponent's reply it means the
+            // solution array was either under-parsed or this is the last interchange
+            // before the player's checkmate; either way, let the player continue.
+            // puzzleDone is only ever set to true inside doMove (the player's branch).
+            setStatus('info', 'Your turn — find the next move!');
         }
-
 
         // ── Undo / Reset ──────────────────────────────────────────────────────────────
         function undoMove() {
             if (!moveHistory.length || puzzleDone) return;
 
-            // If the last entry was an opponent move, undo it first silently
+            // If the last entry was an opponent move, undo it first
             const last = moveHistory[moveHistory.length - 1];
             if (last && !last.isPlayer) {
                 game.undo(); moveHistory.pop(); solIdx--;
@@ -612,6 +674,18 @@
             }
             el.innerHTML = html; el.scrollTop = el.scrollHeight;
         }
+
+        // ── Sound Effects ─────────────────────────────────────────────────────────────
+        const SFX = {
+            move: new Audio('https://lichess1.org/assets/sound/standard/Move.mp3'),
+            capture: new Audio('https://lichess1.org/assets/sound/standard/Capture.mp3'),
+            castle: new Audio('https://lichess1.org/assets/sound/standard/Castle.mp3'),
+            check: new Audio('https://lichess1.org/assets/sound/standard/Check.mp3'),
+            wrong: new Audio('https://lichess1.org/assets/sound/standard/Error.mp3'),
+            solved: new Audio('https://lichess1.org/assets/sound/standard/Victory.mp3'),
+        };
+
+        Object.values(SFX).forEach(a => { try { a.load(); } catch (e) { } });
 
         init();
     </script>
