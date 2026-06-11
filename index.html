@@ -61,6 +61,17 @@
         let lastFrom = null, lastTo = null;
         let moveHistory = [], puzzleDone = false;
 
+        // arrow vars
+        let arrows = [];
+        let arrowStart = null;
+        document.addEventListener("contextmenu", e => e.preventDefault());  // disable right click menu
+        document.addEventListener('keydown', e => { // esc key removes arrows
+            if (e.key === 'Escape') {
+                arrows = [];
+                drawArrows();
+            }
+        });
+
         // ── Session storage ───────────────────────────────────────────────────────────
         function loadSession() { try { puzzles = JSON.parse(sessionStorage.getItem('cpv_v4')) || {}; } catch (e) { puzzles = {}; } }
         function saveSession() { sessionStorage.setItem('cpv_v4', JSON.stringify(puzzles)); }
@@ -174,30 +185,27 @@
             solutionMoves = parseSolution(p.pgn);
             solIdx = 0; selectedSq = null; legalTargets = [];
             lastFrom = null; lastTo = null; moveHistory = []; puzzleDone = false;
+            arrows = []; // clear arrows when loading a new puzzle
             renderPuzzleUI(p);
             renderSidebar();
         }
 
         // ── parseSolution ─────────────────────────────────────────────────────────────
-        // Chess.com puzzle PGNs contain only the solution moves (not full game
-        // history), so we simply replay every non-move-number token against a fresh
-        // copy of the puzzle FEN.  chess.js rejects anything that isn't a legal move
-        // at that point, so stray header tokens are silently skipped.
         function parseSolution(pgn = '') {
             const tmp = new Chess(startFen);
             const clean = pgn
-                .replace(/\{[^}]*\}/g, '')          // remove {comments}
-                .replace(/\([^)]*\)/g, '')          // remove (variations)
-                .replace(/\$\d+/g, '')              // remove $NAG symbols
-                .replace(/[!?]+/g, '')              // remove move annotation suffixes (!, !!, !?, ?!, ?)
-                .replace(/1-0|0-1|1\/2-1\/2|\*/g, ''); // remove result
+                .replace(/\{[^}]*\}/g, '')
+                .replace(/\([^)]*\)/g, '')
+                .replace(/\$\d+/g, '')
+                .replace(/[!?]+/g, '')
+                .replace(/1-0|0-1|1\/2-1\/2|\*/g, '');
 
             const tokens = clean.split(/\s+/).filter(t => t.trim());
             const moves = [];
             for (const t of tokens) {
                 if (/^\d+\.+$/.test(t) || !t) continue;
                 const m = tmp.move(t, { sloppy: true });
-                if (m) moves.push(m.san); // store chess.js-normalised SAN
+                if (m) moves.push(m.san);
             }
             console.log('[Vault] Parsed solution moves:', moves);
             return moves;
@@ -211,7 +219,10 @@
             document.getElementById('content').innerHTML = `
     <div class="puzzle-area">
       <div class="board-col">
-        <div id="board"></div>
+        <div class="board-wrapper">
+            <div id="board"></div>
+            <canvas id="arrow-layer"></canvas>
+        </div>
         <div class="board-controls">
           <button class="ghost" onclick="resetPuzzle()">↺ Reset</button>
           <button class="ghost" onclick="undoMove()">← Undo</button>
@@ -285,7 +296,6 @@
                     const div = document.createElement('div');
                     div.className = cls;
                     div.dataset.sq = sq;
-                    // Piece image — hide only when this square is actively being dragged
                     if (piece) {
                         const img = document.createElement('img');
                         img.className = 'piece';
@@ -294,7 +304,6 @@
                         if (dragState.active && dragState.from === sq) img.style.opacity = '0';
                         div.appendChild(img);
                     }
-                    // Coordinate labels
                     if (fi === 0) {
                         const s = document.createElement('span');
                         s.className = 'coord rank'; s.textContent = r;
@@ -305,21 +314,28 @@
                         s.className = 'coord file'; s.textContent = f;
                         div.appendChild(s);
                     }
-                    // Both click and drag start from mousedown/touchstart
-                    div.addEventListener('mousedown', e => onPointerDown(e, sq));
+                    // FIX 2: only handle left-click in onPointerDown; right-click goes to startArrow
+                    div.addEventListener('mousedown', e => {
+                        if (e.button === 0) onPointerDown(e, sq);
+                        if (e.button === 2) {
+                            e.preventDefault();
+                            startArrow(sq);
+                        }
+                    });
                     div.addEventListener('touchstart', e => onPointerDown(e, sq), { passive: false });
                     el.appendChild(div);
                 });
             });
+            drawArrows();
         }
 
         // ── Drag state ────────────────────────────────────────────────────────────────
         let dragState = {
             active: false,
             from: null,
-            ghost: null, // floating img element
+            ghost: null,
             startX: 0, startY: 0,
-            moved: false,  // did the pointer travel far enough to count as a drag?
+            moved: false,
         };
 
         function getClientXY(e) {
@@ -329,7 +345,6 @@
         }
 
         function sqFromPoint(x, y) {
-            // Hide ghost temporarily so elementFromPoint sees the board squares beneath
             if (dragState.ghost) dragState.ghost.style.display = 'none';
             const el = document.elementFromPoint(x, y);
             if (dragState.ghost) dragState.ghost.style.display = '';
@@ -338,14 +353,19 @@
             return sq ? sq.dataset.sq : null;
         }
 
+        // FIX 1 + 2: onPointerDown only fires for left-clicks (button===0).
+        // Left-clicks always clear any drawn arrows first.
         function onPointerDown(e, sq) {
+            // Clear all arrows on any left-click (matches chess.com behaviour)
+            arrows = [];
+            drawArrows();
+
             if (puzzleDone || !game) return;
             const playerColor = sideToMove(startFen) === 'white' ? 'w' : 'b';
             if (game.turn() !== playerColor) return;
 
             const piece = game.get(sq);
             if (!piece || piece.color !== playerColor) {
-                // Clicked an empty square or opponent piece — handle as click target
                 handleClickTarget(sq);
                 return;
             }
@@ -366,12 +386,10 @@
             dragState.active = false;
             dragState.moved = false;
 
-            // Select this piece and show legal moves
             selectedSq = sq;
             legalTargets = game.moves({ square: sq, verbose: true }).map(m => m.to);
             drawBoard();
 
-            // Create ghost image that follows cursor
             const boardEl = document.getElementById('board');
             const sqSize = boardEl ? boardEl.offsetWidth / 8 : 72;
 
@@ -399,11 +417,10 @@
             const { x, y } = getClientXY(e);
             const dx = x - dragState.startX, dy = y - dragState.startY;
 
-            // Only activate drag after moving 4px (avoids accidental drags on clicks)
             if (!dragState.active && Math.sqrt(dx * dx + dy * dy) > 4) {
                 dragState.active = true;
                 dragState.ghost.style.display = '';
-                drawBoard(); // hide the piece on its square now that we're dragging
+                drawBoard();
             }
 
             if (dragState.active && dragState.ghost) {
@@ -412,7 +429,6 @@
                 dragState.ghost.style.left = (x - sqSize / 2) + 'px';
                 dragState.ghost.style.top = (y - sqSize / 2) + 'px';
 
-                // Highlight square under cursor
                 const hoverSq = sqFromPoint(x, y);
                 document.querySelectorAll('.sq.drag-over').forEach(el => el.classList.remove('drag-over'));
                 if (hoverSq && legalTargets.includes(hoverSq)) {
@@ -434,7 +450,6 @@
             const { x, y } = getClientXY(e);
 
             if (dragState.active) {
-                // It was a drag — try to drop on the square under cursor
                 const targetSq = sqFromPoint(x, y);
                 dragState.active = false;
                 const from = dragState.from;
@@ -443,18 +458,138 @@
                 if (targetSq && legalTargets.includes(targetSq)) {
                     doMove(from, targetSq);
                 } else {
-                    // Dropped off-board or on illegal square — cancel
                     selectedSq = null; legalTargets = [];
                     drawBoard();
                 }
             } else {
-                // It was a click (pointer barely moved) — let click logic handle it
                 dragState.from = null;
-                // selectedSq is already set by onPointerDown; nothing else to do
             }
         }
 
-        // ── Click handler (for second-click-to-move)─────────────────────────────────────────────────────────────
+        // ── Arrow drawing ─────────────────────────────────────────────────────────────
+        function startArrow(fromSq) {
+            arrowStart = fromSq;
+
+            const finish = (e) => {
+                const target = e.target.closest('[data-sq]');
+                if (target) {
+                    const toSq = target.dataset.sq;
+                    if (fromSq !== toSq) {
+                        arrows.push({ from: fromSq, to: toSq });
+                        drawArrows();
+                    }
+                }
+                document.removeEventListener('mouseup', finish);
+            };
+
+            document.addEventListener('mouseup', finish);
+        }
+
+        // Returns true if the move from→to is a knight's L-shaped jump
+        function isKnightMove(fromSq, toSq) {
+            const fileDiff = Math.abs(fromSq.charCodeAt(0) - toSq.charCodeAt(0));
+            const rankDiff = Math.abs(parseInt(fromSq[1]) - parseInt(toSq[1]));
+            return (fileDiff === 1 && rankDiff === 2) || (fileDiff === 2 && rankDiff === 1);
+        }
+
+        // FIX 3: drawArrows now clears properly and draws L-shaped paths for knight moves
+        function drawArrows() {
+            const canvas = document.getElementById('arrow-layer');
+            if (!canvas) return;
+
+            const board = document.getElementById('board');
+            // Setting canvas dimensions clears it — explicit clearRect after for safety
+            canvas.width = board.offsetWidth;
+            canvas.height = board.offsetHeight;
+
+            if (!arrows.length) return;
+
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            const sqSize = board.offsetWidth / 8;
+            const HEAD_SIZE = 24;
+            const SHAFT_WIDTH = 13;
+            const COLOR = 'rgba(255,170,0,0.6)';
+
+            arrows.forEach(({ from: fromSq, to: toSq }) => {
+                const from = squareCenter(fromSq, sqSize);
+                const to = squareCenter(toSq, sqSize);
+
+                ctx.strokeStyle = COLOR;
+                ctx.fillStyle = COLOR;
+                ctx.lineWidth = SHAFT_WIDTH;
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+
+                let headAngle;
+
+                if (isKnightMove(fromSq, toSq)) {
+                    // FIX 3: L-shaped path — go along the longer axis first, then the shorter
+                    const fileDiff = Math.abs(fromSq.charCodeAt(0) - toSq.charCodeAt(0));
+                    // If file difference is 2, move horizontally first then vertically;
+                    // if rank difference is 2, move vertically first then horizontally.
+                    const corner = fileDiff === 2
+                        ? { x: to.x, y: from.y }   // horizontal leg first
+                        : { x: from.x, y: to.y };  // vertical leg first
+
+                    headAngle = Math.atan2(to.y - corner.y, to.x - corner.x);
+                    const shaftEnd = {
+                        x: to.x - HEAD_SIZE * 0.75 * Math.cos(headAngle),
+                        y: to.y - HEAD_SIZE * 0.75 * Math.sin(headAngle),
+                    };
+
+                    ctx.beginPath();
+                    ctx.moveTo(from.x, from.y);
+                    ctx.lineTo(corner.x, corner.y);
+                    ctx.lineTo(shaftEnd.x, shaftEnd.y);
+                    ctx.stroke();
+                } else {
+                    // Straight arrow
+                    headAngle = Math.atan2(to.y - from.y, to.x - from.x);
+                    const shaftEnd = {
+                        x: to.x - HEAD_SIZE * 0.75 * Math.cos(headAngle),
+                        y: to.y - HEAD_SIZE * 0.75 * Math.sin(headAngle),
+                    };
+
+                    ctx.beginPath();
+                    ctx.moveTo(from.x, from.y);
+                    ctx.lineTo(shaftEnd.x, shaftEnd.y);
+                    ctx.stroke();
+                }
+
+                // Arrowhead triangle (same for both straight and L-shaped)
+                ctx.beginPath();
+                ctx.moveTo(to.x, to.y);
+                ctx.lineTo(
+                    to.x - HEAD_SIZE * Math.cos(headAngle - Math.PI / 6),
+                    to.y - HEAD_SIZE * Math.sin(headAngle - Math.PI / 6)
+                );
+                ctx.lineTo(
+                    to.x - HEAD_SIZE * Math.cos(headAngle + Math.PI / 6),
+                    to.y - HEAD_SIZE * Math.sin(headAngle + Math.PI / 6)
+                );
+                ctx.closePath();
+                ctx.fill();
+            });
+        }
+
+        function squareCenter(square, sqSize) {
+            const file = square.charCodeAt(0) - 97;
+            const rank = parseInt(square[1]);
+            const flipped = sideToMove(startFen) === 'black';
+            let x, y;
+            if (!flipped) {
+                x = file * sqSize + sqSize / 2;
+                y = (8 - rank) * sqSize + sqSize / 2;
+            } else {
+                x = (7 - file) * sqSize + sqSize / 2;
+                y = (rank - 1) * sqSize + sqSize / 2;
+            }
+            return { x, y };
+        }
+
+        // ── Click handler (for second-click-to-move) ──────────────────────────────────
         function handleClickTarget(sq) {
             if (puzzleDone || !game) return;
             const playerColor = sideToMove(startFen) === 'white' ? 'w' : 'b';
@@ -463,33 +598,25 @@
 
             if (selectedSq) {
                 if (legalTargets.includes(sq)) {
-                    // Valid destination — make the move
                     doMove(selectedSq, sq); return;
                 }
                 if (piece && piece.color === playerColor) {
-                    // Clicked a different own piece — switch selection to it
                     selectedSq = sq;
                     legalTargets = game.moves({ square: sq, verbose: true }).map(m => m.to);
                     drawBoard(); return;
                 }
-                // Clicked empty or opponent square that isn't a legal move — deselect
                 selectedSq = null; legalTargets = [];
                 drawBoard();
             }
         }
 
-        // ── FIX 2: Wrap audio calls in try-catch everywhere ───────────────────────────
-        // Setting .currentTime = 0 on an Audio element that failed to load can throw
-        // a synchronous DOMException in some browsers, which would abort the calling
-        // function mid-execution and leave the game in a broken state.
+        // ── Sound helpers ─────────────────────────────────────────────────────────────
         function playSound(sfx) {
             try {
                 sfx.currentTime = 0;
                 const p = sfx.play();
                 if (p && typeof p.catch === 'function') p.catch(() => { });
-            } catch (e) {
-                // Audio not available — silently ignore
-            }
+            } catch (e) { }
         }
 
         function soundForMove(move) {
@@ -551,44 +678,24 @@
         }
 
         // ── Robust move matching ──────────────────────────────────────────────────────
-        // We already know the player made a legal move; we just need to confirm it
-        // lands on the correct destination square (and matches piece type for safety).
         function moveMatchesSolution(playedMove, expectedSan) {
             if (!expectedSan) return false;
             const strip = s => s.replace(/[+#!?]/g, '');
             return strip(playedMove.san) === strip(expectedSan);
         }
 
-        // ── FIX 3: Opponent auto-reply — graceful recovery + no premature puzzleDone ─
-        // Two previous bugs lived here:
-        //   (a) If game.move() returned null the function silently returned, leaving
-        //       game.turn() as the opponent's colour — the player could not interact at
-        //       all, and even undo appeared to do nothing because the board re-drew in
-        //       the same stuck state.
-        //   (b) The "shouldn't normally happen" puzzleDone = true block fired whenever
-        //       parseSolution had under-counted the solution moves (e.g. because the
-        //       PGN contained full-game history and some early moves were coincidentally
-        //       legal from the puzzle FEN).  This set puzzleDone = true after the
-        //       opponent's check, locking both the board AND the undo button.
-        //
-        // Fix: (a) on move failure, undo the player's last move to restore a clean
-        // interactive state; (b) never mark the puzzle done inside playOpponentMove —
-        // a puzzle is only "solved" when the PLAYER makes the decisive last move.
+        // ── Opponent auto-reply ───────────────────────────────────────────────────────
         function playOpponentMove() {
             const san = solutionMoves[solIdx];
             if (!san) {
-                // No more opponent moves in the solution — player has one more move to find
                 setStatus('info', 'Your turn — find the next move!');
                 return;
             }
 
             const move = game.move(san, { sloppy: true });
 
-            // ── (a) Recovery when the opponent move fails to apply ────────────────────
             if (!move) {
                 console.error('[Vault] Opponent move failed:', san, '| FEN:', game.fen());
-                // Undo the player's last move so game.turn() goes back to the player's
-                // colour and the board remains fully interactive.
                 const lastEntry = moveHistory[moveHistory.length - 1];
                 if (lastEntry && lastEntry.isPlayer) {
                     game.undo();
@@ -609,12 +716,6 @@
             drawBoard();
             soundForMove(move);
 
-            // ── (b) Do NOT set puzzleDone here ───────────────────────────────────────
-            // Puzzles should always end with the player's winning move.  If solIdx has
-            // reached the end of solutionMoves after the opponent's reply it means the
-            // solution array was either under-parsed or this is the last interchange
-            // before the player's checkmate; either way, let the player continue.
-            // puzzleDone is only ever set to true inside doMove (the player's branch).
             setStatus('info', 'Your turn — find the next move!');
         }
 
@@ -622,13 +723,11 @@
         function undoMove() {
             if (!moveHistory.length || puzzleDone) return;
 
-            // If the last entry was an opponent move, undo it first
             const last = moveHistory[moveHistory.length - 1];
             if (last && !last.isPlayer) {
                 game.undo(); moveHistory.pop(); solIdx--;
             }
 
-            // Now undo the player's move
             if (moveHistory.length && moveHistory[moveHistory.length - 1].isPlayer) {
                 game.undo(); moveHistory.pop(); solIdx--;
             }
@@ -643,6 +742,7 @@
             game = new Chess(startFen);
             solIdx = 0; selectedSq = null; legalTargets = [];
             lastFrom = null; lastTo = null; moveHistory = []; puzzleDone = false;
+            arrows = [];
             setStatus('info', 'Find the best move for ' + sideToMove(startFen) + '!');
             renderMoveHistory(); drawBoard();
         }
@@ -686,7 +786,6 @@
         };
 
         Object.values(SFX).forEach(a => { try { a.load(); } catch (e) { } });
-
         init();
     </script>
 </body>
