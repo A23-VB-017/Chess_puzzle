@@ -61,14 +61,17 @@
         let lastFrom = null, lastTo = null;
         let moveHistory = [], puzzleDone = false;
 
-        // arrow vars
+        // arrow / highlight vars
         let arrows = [];
+        let highlights = new Set(); // squares tinted red by right-click
         let arrowStart = null;
-        document.addEventListener("contextmenu", e => e.preventDefault());  // disable right click menu
-        document.addEventListener('keydown', e => { // esc key removes arrows
+        document.addEventListener("contextmenu", e => e.preventDefault());
+        document.addEventListener('keydown', e => { // esc clears arrows + highlights
             if (e.key === 'Escape') {
                 arrows = [];
+                highlights.clear();
                 drawArrows();
+                drawBoard();
             }
         });
 
@@ -185,7 +188,7 @@
             solutionMoves = parseSolution(p.pgn);
             solIdx = 0; selectedSq = null; legalTargets = [];
             lastFrom = null; lastTo = null; moveHistory = []; puzzleDone = false;
-            arrows = []; // clear arrows when loading a new puzzle
+            arrows = []; highlights.clear(); // clear arrows + highlights on puzzle load
             renderPuzzleUI(p);
             renderSidebar();
         }
@@ -292,6 +295,7 @@
                     if (isLast) cls += ' last-from';
                     if (isLegal && !isCap) cls += ' legal-move';
                     if (isCap) cls += ' legal-capture';
+                    if (highlights.has(sq)) cls += ' highlighted';
 
                     const div = document.createElement('div');
                     div.className = cls;
@@ -356,9 +360,10 @@
         // FIX 1 + 2: onPointerDown only fires for left-clicks (button===0).
         // Left-clicks always clear any drawn arrows first.
         function onPointerDown(e, sq) {
-            // Clear all arrows on any left-click (matches chess.com behaviour)
+            // Clear all arrows and highlights on any left-click
             arrows = [];
-            drawArrows();
+            highlights.clear();
+            drawBoard(); // redraws board (clears highlight tints) and calls drawArrows internally
 
             if (puzzleDone || !game) return;
             const playerColor = sideToMove(startFen) === 'white' ? 'w' : 'b';
@@ -468,17 +473,21 @@
 
         // ── Arrow drawing ─────────────────────────────────────────────────────────────
         function startArrow(fromSq) {
-            arrowStart = fromSq;
-
             const finish = (e) => {
                 const target = e.target.closest('[data-sq]');
-                if (target) {
-                    const toSq = target.dataset.sq;
-                    if (fromSq !== toSq) {
-                        arrows.push({ from: fromSq, to: toSq });
-                        drawArrows();
-                    }
+                const toSq   = target ? target.dataset.sq : null;
+
+                if (toSq && toSq !== fromSq) {
+                    // Dragged to a different square → draw arrow
+                    arrows.push({ from: fromSq, to: toSq });
+                    drawArrows();
+                } else {
+                    // Released on the origin square → toggle red highlight
+                    if (highlights.has(fromSq)) highlights.delete(fromSq);
+                    else highlights.add(fromSq);
+                    drawBoard();
                 }
+
                 document.removeEventListener('mouseup', finish);
             };
 
@@ -492,46 +501,51 @@
             return (fileDiff === 1 && rankDiff === 2) || (fileDiff === 2 && rankDiff === 1);
         }
 
-        // FIX 3: drawArrows now clears properly and draws L-shaped paths for knight moves
         function drawArrows() {
             const canvas = document.getElementById('arrow-layer');
             if (!canvas) return;
 
             const board = document.getElementById('board');
-            // Setting canvas dimensions clears it — explicit clearRect after for safety
-            canvas.width = board.offsetWidth;
+            canvas.width  = board.offsetWidth;
             canvas.height = board.offsetHeight;
 
             if (!arrows.length) return;
 
-            const ctx = canvas.getContext('2d');
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-            const sqSize = board.offsetWidth / 8;
-            const HEAD_SIZE = 24;
+            const ctx        = canvas.getContext('2d');
+            const sqSize     = board.offsetWidth / 8;
+            const HEAD_SIZE  = 24;
             const SHAFT_WIDTH = 13;
-            const COLOR = 'rgba(255,170,0,0.6)';
+            const ALPHA      = 0.6;
+            const COLOR      = 'rgb(255, 170, 0)'; // fully opaque; alpha applied at composite step
+
+            // Reusable offscreen canvas — cleared per arrow.
+            // Shaft and arrowhead are both painted opaque here, then the finished
+            // arrow is blitted to the visible canvas with globalAlpha in one shot.
+            // This prevents the shaft/head overlap region from double-applying alpha.
+            const off    = document.createElement('canvas');
+            off.width    = canvas.width;
+            off.height   = canvas.height;
+            const offCtx = off.getContext('2d');
 
             arrows.forEach(({ from: fromSq, to: toSq }) => {
-                const from = squareCenter(fromSq, sqSize);
-                const to = squareCenter(toSq, sqSize);
+                offCtx.clearRect(0, 0, off.width, off.height);
 
-                ctx.strokeStyle = COLOR;
-                ctx.fillStyle = COLOR;
-                ctx.lineWidth = SHAFT_WIDTH;
-                ctx.lineCap = 'round';
-                ctx.lineJoin = 'round';
+                const from = squareCenter(fromSq, sqSize);
+                const to   = squareCenter(toSq,   sqSize);
+
+                offCtx.strokeStyle = COLOR;
+                offCtx.fillStyle   = COLOR;
+                offCtx.lineWidth   = SHAFT_WIDTH;
+                offCtx.lineCap     = 'butt';   // flat tail; lineJoin stays round for L-corner
+                offCtx.lineJoin    = 'round';
 
                 let headAngle;
 
                 if (isKnightMove(fromSq, toSq)) {
-                    // FIX 3: L-shaped path — go along the longer axis first, then the shorter
                     const fileDiff = Math.abs(fromSq.charCodeAt(0) - toSq.charCodeAt(0));
-                    // If file difference is 2, move horizontally first then vertically;
-                    // if rank difference is 2, move vertically first then horizontally.
-                    const corner = fileDiff === 2
-                        ? { x: to.x, y: from.y }   // horizontal leg first
-                        : { x: from.x, y: to.y };  // vertical leg first
+                    const corner   = fileDiff === 2
+                        ? { x: to.x, y: from.y }  // horizontal leg first
+                        : { x: from.x, y: to.y }; // vertical leg first
 
                     headAngle = Math.atan2(to.y - corner.y, to.x - corner.x);
                     const shaftEnd = {
@@ -539,38 +553,42 @@
                         y: to.y - HEAD_SIZE * 0.75 * Math.sin(headAngle),
                     };
 
-                    ctx.beginPath();
-                    ctx.moveTo(from.x, from.y);
-                    ctx.lineTo(corner.x, corner.y);
-                    ctx.lineTo(shaftEnd.x, shaftEnd.y);
-                    ctx.stroke();
+                    offCtx.beginPath();
+                    offCtx.moveTo(from.x, from.y);
+                    offCtx.lineTo(corner.x, corner.y);
+                    offCtx.lineTo(shaftEnd.x, shaftEnd.y);
+                    offCtx.stroke();
                 } else {
-                    // Straight arrow
                     headAngle = Math.atan2(to.y - from.y, to.x - from.x);
                     const shaftEnd = {
                         x: to.x - HEAD_SIZE * 0.75 * Math.cos(headAngle),
                         y: to.y - HEAD_SIZE * 0.75 * Math.sin(headAngle),
                     };
 
-                    ctx.beginPath();
-                    ctx.moveTo(from.x, from.y);
-                    ctx.lineTo(shaftEnd.x, shaftEnd.y);
-                    ctx.stroke();
+                    offCtx.beginPath();
+                    offCtx.moveTo(from.x, from.y);
+                    offCtx.lineTo(shaftEnd.x, shaftEnd.y);
+                    offCtx.stroke();
                 }
 
-                // Arrowhead triangle (same for both straight and L-shaped)
-                ctx.beginPath();
-                ctx.moveTo(to.x, to.y);
-                ctx.lineTo(
+                // Arrowhead — drawn opaque alongside the shaft on the offscreen surface
+                offCtx.beginPath();
+                offCtx.moveTo(to.x, to.y);
+                offCtx.lineTo(
                     to.x - HEAD_SIZE * Math.cos(headAngle - Math.PI / 6),
                     to.y - HEAD_SIZE * Math.sin(headAngle - Math.PI / 6)
                 );
-                ctx.lineTo(
+                offCtx.lineTo(
                     to.x - HEAD_SIZE * Math.cos(headAngle + Math.PI / 6),
                     to.y - HEAD_SIZE * Math.sin(headAngle + Math.PI / 6)
                 );
-                ctx.closePath();
-                ctx.fill();
+                offCtx.closePath();
+                offCtx.fill();
+
+                // Composite the completed opaque arrow as a single unit
+                ctx.globalAlpha = ALPHA;
+                ctx.drawImage(off, 0, 0);
+                ctx.globalAlpha = 1.0;
             });
         }
 
@@ -742,7 +760,7 @@
             game = new Chess(startFen);
             solIdx = 0; selectedSq = null; legalTargets = [];
             lastFrom = null; lastTo = null; moveHistory = []; puzzleDone = false;
-            arrows = [];
+            arrows = []; highlights.clear();
             setStatus('info', 'Find the best move for ' + sideToMove(startFen) + '!');
             renderMoveHistory(); drawBoard();
         }
